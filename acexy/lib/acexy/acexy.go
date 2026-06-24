@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -74,11 +75,20 @@ type ongoingStream struct {
 	evicted   map[io.Writer]struct{} // writers evicted by PMultiWriter timeout
 }
 
+// Backend identifies a single AceStream engine instance in the pool.
+type Backend struct {
+	Scheme string
+	Host   string
+	Port   int
+}
+
 // Structure referencing the AceStream Proxy - this is, ourselves
 type Acexy struct {
 	Scheme                string        // The scheme to be used when connecting to the AceStream middleware
 	Host                  string        // The host to be used when connecting to the AceStream middleware
 	Port                  int           // The port to be used when connecting to the AceStream middleware
+	Backends              []Backend     // Pool of AceStream engine backends. If empty, built from Scheme/Host/Port.
+	nextBackend           uint64        // Round-robin counter for backend selection (atomic).
 	Endpoint              AcexyEndpoint // The endpoint to be used when connecting to the AceStream middleware
 	EmptyTimeout          time.Duration // Timeout after which, if no data is written, the stream is closed
 	BufferSize            int           // The buffer size to use when copying the data
@@ -102,6 +112,9 @@ const (
 // Initializes the Acexy structure
 func (a *Acexy) Init() {
 	a.streams = make(map[AceID]*ongoingStream)
+	if len(a.Backends) == 0 {
+		a.Backends = []Backend{{Scheme: a.Scheme, Host: a.Host, Port: a.Port}}
+	}
 	a.mutex = &sync.Mutex{}
 	// The transport to be used when connecting to the AceStream middleware. We have to tweak it
 	// a little bit to avoid compression and to limit the number of connections per host. Otherwise,
@@ -139,9 +152,21 @@ func (a *Acexy) FetchStream(aceId AceID, extraParams url.Values) (*AceStream, er
 	// all other operations if the mutex were held.
 	a.mutex.Unlock()
 
-	middleware, err := GetStream(a, aceId, extraParams)
+	var middleware *AceStreamMiddleware
+	var err error
+	n := len(a.Backends)
+	start := int(atomic.AddUint64(&a.nextBackend, 1))
+	for i := 0; i < n; i++ {
+		backend := a.Backends[(start+i)%n]
+		middleware, err = GetStream(a, backend, aceId, extraParams)
+		if err == nil {
+			slog.Debug("Stream assigned to backend", "stream", aceId, "backend", backend.Host)
+			break
+		}
+		slog.Warn("Backend getstream failed, trying next", "backend", backend.Host, "error", err)
+	}
 	if err != nil {
-		slog.Error("Error getting stream middleware", "error", err)
+		slog.Error("Error getting stream middleware (all backends failed)", "error", err)
 		return nil, err
 	}
 
@@ -395,10 +420,10 @@ func (a *Acexy) WaitStream(stream *AceStream) <-chan struct{} {
 // by the “id“ identifier. Optionally, takes extra parameters to customize the stream.
 // Returns the response from the AceStream backend. If the request fails, an error is returned.
 // If the `AceStreamMiddleware:error` field is not empty, an error is returned.
-func GetStream(a *Acexy, aceId AceID, extraParams url.Values) (*AceStreamMiddleware, error) {
+func GetStream(a *Acexy, backend Backend, aceId AceID, extraParams url.Values) (*AceStreamMiddleware, error) {
 	slog.Debug("Getting stream", "id", aceId, "extraParams", extraParams)
-	slog.Debug("Acexy Information", "scheme", a.Scheme, "host", a.Host, "port", a.Port)
-	req, err := http.NewRequest("GET", a.Scheme+"://"+a.Host+":"+strconv.Itoa(a.Port)+string(a.Endpoint), nil)
+	slog.Debug("Acexy Information", "scheme", backend.Scheme, "host", backend.Host, "port", backend.Port)
+	req, err := http.NewRequest("GET", backend.Scheme+"://"+backend.Host+":"+strconv.Itoa(backend.Port)+string(a.Endpoint), nil)
 	if err != nil {
 		return nil, err
 	}

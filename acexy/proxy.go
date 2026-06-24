@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -353,11 +354,36 @@ func main() {
 	} else {
 		endpoint = acexy.MPEG_TS_ENDPOINT
 	}
+	// Build the backend pool from ACEXY_HOSTS (comma-separated host[:port], optional
+	// scheme://). Falls back to the single ACEXY_HOST/ACEXY_PORT when unset.
+	var backends []acexy.Backend
+	if raw, ok := os.LookupEnv("ACEXY_HOSTS"); ok && strings.TrimSpace(raw) != "" {
+		for _, item := range strings.Split(raw, ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			bScheme, bHost, bPort := scheme, item, port
+			if i := strings.Index(bHost, "://"); i >= 0 {
+				bScheme = bHost[:i]
+				bHost = bHost[i+3:]
+			}
+			if i := strings.LastIndex(bHost, ":"); i >= 0 {
+				if pp, e := strconv.Atoi(bHost[i+1:]); e == nil {
+					bPort = pp
+					bHost = bHost[:i]
+				}
+			}
+			backends = append(backends, acexy.Backend{Scheme: bScheme, Host: bHost, Port: bPort})
+		}
+		slog.Info("Using AceStream backend pool", "backends", backends)
+	}
 	// Create a new Acexy instance
 	acexy := &acexy.Acexy{
 		Scheme:                scheme,
 		Host:                  host,
 		Port:                  port,
+		Backends:              backends,
 		Endpoint:              endpoint,
 		EmptyTimeout:          emptyTimeout,
 		BufferSize:            int(size.Bytes),
