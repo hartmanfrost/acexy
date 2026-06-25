@@ -378,12 +378,17 @@ func main() {
 		}
 		slog.Info("Using AceStream backend pool", "backends", backends)
 	}
+	backendCooldown := LookupEnvOrDuration("ACEXY_BACKEND_COOLDOWN", 0)
+	if backendCooldown > 0 {
+		slog.Info("Per-backend cold-start cooldown enabled", "cooldown", backendCooldown)
+	}
 	// Create a new Acexy instance
 	acexy := &acexy.Acexy{
 		Scheme:                scheme,
 		Host:                  host,
 		Port:                  port,
 		Backends:              backends,
+		BackendCooldown:       backendCooldown,
 		Endpoint:              endpoint,
 		EmptyTimeout:          emptyTimeout,
 		BufferSize:            int(size.Bytes),

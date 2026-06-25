@@ -89,6 +89,9 @@ type Acexy struct {
 	Port                  int           // The port to be used when connecting to the AceStream middleware
 	Backends              []Backend     // Pool of AceStream engine backends. If empty, built from Scheme/Host/Port.
 	nextBackend           uint64        // Round-robin counter for backend selection (atomic).
+	BackendCooldown       time.Duration // Minimum spacing between new-stream cold-starts on one backend (engine serializes them).
+	backendAvailableAt    []time.Time   // Per-backend earliest time the next cold-start may be sent.
+	cooldownMu            sync.Mutex    // Guards backendAvailableAt.
 	Endpoint              AcexyEndpoint // The endpoint to be used when connecting to the AceStream middleware
 	EmptyTimeout          time.Duration // Timeout after which, if no data is written, the stream is closed
 	BufferSize            int           // The buffer size to use when copying the data
@@ -115,6 +118,7 @@ func (a *Acexy) Init() {
 	if len(a.Backends) == 0 {
 		a.Backends = []Backend{{Scheme: a.Scheme, Host: a.Host, Port: a.Port}}
 	}
+	a.backendAvailableAt = make([]time.Time, len(a.Backends))
 	a.mutex = &sync.Mutex{}
 	// The transport to be used when connecting to the AceStream middleware. We have to tweak it
 	// a little bit to avoid compression and to limit the number of connections per host. Otherwise,
@@ -137,6 +141,37 @@ func (a *Acexy) Init() {
 // the same time through the middleware. When the last client finishes, the stream is removed.
 // The stream is identified by the “id“ identifier. Optionally, takes extra parameters to
 // customize the stream.
+// acquireBackend picks the engine backend that can accept a new-stream cold-start soonest,
+// honoring BackendCooldown. AceStream serializes swarm joins to ~1 at a time, so after a
+// cold-start a backend is "busy" for the cooldown window. This reserves the least-recently
+// used backend for another window and blocks until it is actually free. With cooldown 0 it
+// degrades to round-robin (the rr counter breaks ties).
+func (a *Acexy) acquireBackend() (Backend, int) {
+	a.cooldownMu.Lock()
+	now := time.Now()
+	n := len(a.Backends)
+	rr := int(atomic.AddUint64(&a.nextBackend, 1))
+	best := -1
+	var bestAt time.Time
+	for k := 0; k < n; k++ {
+		i := (rr + k) % n
+		if best == -1 || a.backendAvailableAt[i].Before(bestAt) {
+			best, bestAt = i, a.backendAvailableAt[i]
+		}
+	}
+	startAt := bestAt
+	if startAt.Before(now) {
+		startAt = now
+	}
+	a.backendAvailableAt[best] = startAt.Add(a.BackendCooldown)
+	a.cooldownMu.Unlock()
+	if wait := time.Until(startAt); wait > 0 {
+		slog.Debug("Backend cooldown wait", "backend", a.Backends[best].Host, "wait", wait)
+		time.Sleep(wait)
+	}
+	return a.Backends[best], best
+}
+
 func (a *Acexy) FetchStream(aceId AceID, extraParams url.Values) (*AceStream, error) {
 	a.mutex.Lock()
 
@@ -154,13 +189,11 @@ func (a *Acexy) FetchStream(aceId AceID, extraParams url.Values) (*AceStream, er
 
 	var middleware *AceStreamMiddleware
 	var err error
-	n := len(a.Backends)
-	start := int(atomic.AddUint64(&a.nextBackend, 1))
-	for i := 0; i < n; i++ {
-		backend := a.Backends[(start+i)%n]
+	for attempt := 0; attempt < len(a.Backends); attempt++ {
+		backend, idx := a.acquireBackend()
 		middleware, err = GetStream(a, backend, aceId, extraParams)
 		if err == nil {
-			slog.Debug("Stream assigned to backend", "stream", aceId, "backend", backend.Host)
+			slog.Debug("Stream assigned to backend", "stream", aceId, "backend", backend.Host, "idx", idx)
 			break
 		}
 		slog.Warn("Backend getstream failed, trying next", "backend", backend.Host, "error", err)

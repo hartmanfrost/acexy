@@ -78,3 +78,23 @@ func TestBackendPoolFailover(t *testing.T) {
 	}
 }
 
+// TestBackendCooldownSpacing verifies cold-starts to one backend are spaced by BackendCooldown.
+func TestBackendCooldownSpacing(t *testing.T) {
+	var hits int64
+	b, closeFn := mockEngine(t, &hits)
+	defer closeFn()
+	const cd = 150 * time.Millisecond
+	a := &Acexy{Backends: []Backend{b}, BackendCooldown: cd, Endpoint: MPEG_TS_ENDPOINT, NoResponseTimeout: 5 * time.Second, ClientEvictionTimeout: time.Second}
+	a.Init()
+	start := time.Now()
+	for i := 0; i < 4; i++ {
+		id, _ := NewAceID("", fmt.Sprintf("%040x", i))
+		if _, err := a.FetchStream(id, nil); err != nil {
+			t.Fatalf("FetchStream %d: %v", i, err)
+		}
+	}
+	// 4 cold-starts, one backend, 3 cooldown gaps -> >= 3*cd
+	if elapsed := time.Since(start); elapsed < 3*cd {
+		t.Errorf("cooldown not enforced: 4 cold-starts took %v, want >= %v", elapsed, 3*cd)
+	}
+}
